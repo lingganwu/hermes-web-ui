@@ -37,6 +37,19 @@ process.on('unhandledRejection', (reason) => {
 })
 
 let server: any = null
+let chatRunServer: any = null
+
+/**
+ * 安全获取网络接口信息（兼容 Termux/proot 环境）
+ * 在 proot 环境中 os.networkInterfaces() 会抛出权限错误（errno 13）
+ */
+function safeNetworkInterfaces() {
+  try {
+    return os.networkInterfaces()
+  } catch {
+    return {}
+  }
+}
 
 export async function bootstrap() {
   console.log(`hermes-web-ui v${APP_VERSION} starting...`)
@@ -89,8 +102,10 @@ export async function bootstrap() {
   console.log('[bootstrap] SPA fallback registered')
 
   // Start server
-  console.log(`[bootstrap] listening on port ${config.port}`)
-  server = app.listen(config.port, '0.0.0.0')
+  console.log(`[bootstrap] listening on ${config.host || 'default host'}:${config.port}`)
+  server = config.host
+    ? app.listen(config.port, config.host)
+    : app.listen(config.port)
   console.log('[bootstrap] app.listen called')
 
   setupTerminalWebSocket(server)
@@ -102,7 +117,7 @@ export async function bootstrap() {
   groupChatServer.setGatewayManager(getGatewayManagerInstance())
 
   // Chat run Socket.IO — shares the same Server instance, just adds /chat-run namespace
-  const chatRunServer = new ChatRunSocket(groupChatServer.getIO(), getGatewayManagerInstance())
+  chatRunServer = new ChatRunSocket(groupChatServer.getIO(), getGatewayManagerInstance())
   setChatRunServer(chatRunServer)
   chatRunServer.init()
 
@@ -122,7 +137,7 @@ export async function bootstrap() {
   })
 
   server.on('listening', () => {
-    const interfaces = os.networkInterfaces()
+    const interfaces = safeNetworkInterfaces()
     const localIp = Object.values(interfaces).flat().find(i => i?.family === 'IPv4' && !i?.internal)?.address || 'localhost'
     console.log(`Server: http://localhost:${config.port} (LAN: http://${localIp}:${config.port})`)
     console.log(`Upstream: ${config.upstream}`)
@@ -139,7 +154,7 @@ export async function bootstrap() {
     logger.error({ err }, 'Server error')
   })
 
-  bindShutdown(server, groupChatServer)
+  bindShutdown(server, groupChatServer, chatRunServer)
   startVersionCheck()
 }
 

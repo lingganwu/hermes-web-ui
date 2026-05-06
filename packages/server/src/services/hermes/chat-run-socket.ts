@@ -12,12 +12,14 @@ import type { Server, Socket } from 'socket.io'
 import { EventSource } from 'eventsource'
 import { setRunSession } from '../../routes/hermes/proxy-handler'
 import { updateUsage } from '../../db/hermes/usage-store'
+import { getSystemPrompt } from '../../lib/llm-prompt'
 import {
   getSession,
   getSessionDetail,
   getSessionDetailPaginated,
   createSession,
   addMessage,
+  addMessages,
   updateSessionStats,
   useLocalSessionStore,
 } from '../../db/hermes/session-store'
@@ -91,108 +93,20 @@ async function convertContentBlocks(blocks: ContentBlock[]): Promise<string> {
 const compressor = new ChatContextCompressor()
 
 // --- Helper: Convert OpenAI format to Anthropic format ---
-function convertToAnthropicFormat(messages: any[]): any[] {
+function convertHistoryFormat(messages: any[]): any[] {
   const result: any[] = []
 
   for (const m of messages) {
     const role = m.role
     const content = m.content || ''
-
-    if (role === 'assistant') {
-      const blocks: any[] = []
-
-      // Add thinking block if reasoning_content exists
-      if (m.reasoning) {
-        blocks.push({ type: 'thinking', thinking: m.reasoning })
-      }
-
-      // Add text content
-      if (content) {
-        if (typeof content === 'string') {
-          blocks.push({ type: 'text', text: content })
-        } else if (Array.isArray(content)) {
-          blocks.push(...content)
-        }
-      }
-
-      // Add tool_use blocks
-      if (m.tool_calls && Array.isArray(m.tool_calls)) {
-        for (const tc of m.tool_calls) {
-          if (tc.id && tc.function) {
-            try {
-              const args = parseToolArguments(tc.function.arguments || '{}')
-              blocks.push({
-                type: 'tool_use',
-                id: tc.id,
-                name: tc.function.name,
-                input: args
-              })
-            } catch (e) {
-              logger.warn(e, '[chat-run-socket] failed to parse tool arguments for tool %s', tc.id)
-              blocks.push({
-                type: 'tool_use',
-                id: tc.id,
-                name: tc.function.name,
-                input: {}
-              })
-            }
-          }
-        }
-      }
-
-      // Handle empty content
-      if (blocks.length === 0) {
-        blocks.push({ type: 'text', text: '' })
-      }
-
-      result.push({ role: 'assistant', content: blocks })
-      continue
-    }
-
+    delete m.reasoning_content
     if (role === 'tool') {
       // Convert tool message to tool_result in user message
       // Follow Hermes official format: content is a string (not array)
-      const toolContent = content || '(no output)'
-
-      // Normalize tool_result content to string format
-      // Use robust LLM JSON parser if content looks like JSON
-      let resultContent: string
-      if (typeof toolContent === 'string') {
-        try {
-          // Try to parse as JSON first (handles Python format, single quotes, etc.)
-          const parsed = parseLLMJSON(toolContent, 2)
-          // Re-serialize to ensure clean JSON string
-          resultContent = JSON.stringify(parsed)
-        } catch {
-          // Not valid JSON, use as-is
-          resultContent = toolContent
-        }
-      } else if (typeof toolContent === 'object' && toolContent !== null) {
-        // Object or array, serialize to JSON string
-        resultContent = JSON.stringify(toolContent)
-      } else {
-        // Primitive type (null, undefined, number, boolean)
-        resultContent = String(toolContent !== null && toolContent !== undefined ? toolContent : '(no output)')
-      }
-
-      const toolResult = {
-        type: 'tool_result',
-        tool_use_id: m.tool_call_id || '',
-        content: resultContent
-      }
-
-      // Merge with previous user message if it ends with tool_result
-      if (
-        result.length > 0 &&
-        result[result.length - 1].role === 'user' &&
-        Array.isArray(result[result.length - 1].content) &&
-        result[result.length - 1].content.length > 0 &&
-        result[result.length - 1].content[result[result.length - 1].content.length - 1].type === 'tool_result'
-      ) {
-        result[result.length - 1].content.push(toolResult)
-      } else {
-        result.push({ role: 'user', content: [toolResult] })
-      }
+      let pushItem = { ...m }
+      pushItem.role = 'user'
+      pushItem.content = `[Tool result: ${content}]`
+      result.push(pushItem)
       continue
     }
 
@@ -200,14 +114,15 @@ function convertToAnthropicFormat(messages: any[]): any[] {
     if (role === 'user') {
       // Format: { role: 'user', content: [{ type: 'text', text: '...' }] }
       if (typeof content === 'string') {
-        result.push({ role: 'user', content: [{ type: 'text', text: content || '' }] })
+        result.push({ role: 'user', content: content })
       } else if (Array.isArray(content)) {
         // Already in array format, assume it's correct
-        result.push({ role: 'user', content })
-      } else if (content) {
-        // Fallback for other types
-        result.push({ role: 'user', content: [{ type: 'text', text: String(content) }] })
+        result.push({ role: 'user', content: convertContentBlocks(content) })
       }
+      continue
+    }
+    if (role === 'assistant') {
+      result.push({ ...m })
       continue
     }
   }
@@ -239,10 +154,12 @@ interface SessionState {
   isWorking: boolean
   events: Array<{ event: string; data: any }>
   abortController?: AbortController
+  eventSource?: EventSource
   runId?: string
   profile?: string
   inputTokens?: number
   outputTokens?: number
+  isAborting?: boolean
 }
 
 // --- ChatRunSocket ---
@@ -303,7 +220,7 @@ export class ChatRunSocket {
 
     socket.on('abort', (data: { session_id?: string }) => {
       if (data.session_id) {
-        this.handleAbort(socket, data.session_id)
+        void this.handleAbort(socket, data.session_id)
       }
     })
   }
@@ -455,18 +372,23 @@ export class ChatRunSocket {
           : await getSessionDetailFromDb(sid)
         const messages = detail?.messages ? this.handleMessage(detail.messages, sid) : []
         // Calculate context tokens — aware of compression snapshot
+
         let inputTokens: number
+        let outputTokens: number
         const snapshot = getCompressionSnapshot(sid)
         if (snapshot) {
           const newMessages = messages.slice(snapshot.lastMessageIndex + 1)
           inputTokens = countTokens(SUMMARY_PREFIX + snapshot.summary) +
-            newMessages.reduce((sum, m) => sum + countTokens(m.content || ''), 0)
+            newMessages.filter(m => m.role === 'user').reduce((sum, m) => sum + countTokens(m.content || ''), 0)
+          outputTokens = newMessages
+            .filter(m => m.role === 'assistant' || m.role === 'tool')
+            .reduce((sum, m) => sum + countTokens(m.content || '') + countTokens(m.tool_calls + '' || ''), 0)
         } else {
-          inputTokens = messages.reduce((sum, m) => sum + countTokens(m.content || ''), 0)
+          inputTokens = messages.filter(m => m.role === 'user').reduce((sum, m) => sum + countTokens(m.content || ''), 0)
+          outputTokens = messages
+            .filter(m => m.role === 'assistant' || m.role === 'tool')
+            .reduce((sum, m) => sum + countTokens(m.content || '') + countTokens(m.tool_calls + '' || ''), 0)
         }
-        const outputTokens = messages
-          .filter(m => m.role === 'assistant')
-          .reduce((sum, m) => sum + countTokens(m.content || ''), 0)
         state = {
           messages,
           isWorking: false,
@@ -486,6 +408,7 @@ export class ChatRunSocket {
       session_id: sid,
       messages: state.messages,
       isWorking: state.isWorking,
+      isAborting: state.isAborting || false,
       events: state.isWorking ? state.events : [],
       inputTokens: state.inputTokens,
       outputTokens: state.outputTokens,
@@ -560,15 +483,19 @@ export class ChatRunSocket {
       const body: Record<string, any> = { input }
       if (hermesSessionId) body.session_id = hermesSessionId
       if (model) body.model = model
-      if (instructions) body.instructions = instructions
+      if (instructions) {
+        body.instructions = `${getSystemPrompt()}\n${instructions}`
+      } else {
+        body.instructions = getSystemPrompt()
+      }
       // Inject workspace context if set for this session
       if (session_id) {
         const sessionRow = getSession(session_id)
         if (sessionRow?.workspace) {
           const workspaceCtx = `[Current working directory: ${sessionRow.workspace}]`
           body.instructions = body.instructions
-            ? `${workspaceCtx}\n${body.instructions}`
-            : workspaceCtx
+            ? `\n${workspaceCtx}\n${body.instructions}`
+            : `\n${workspaceCtx}`
         }
       }
       // Build conversation_history from DB if session_id is provided
@@ -650,7 +577,8 @@ export class ChatRunSocket {
               const newMessages = history.slice(snapshot.lastMessageIndex + 1)
               logger.info('[context-compress] session=%s: snapshot at %d, %d new messages, assembled ~%d tokens (threshold %d)',
                 session_id, snapshot.lastMessageIndex, newMessages.length, totalTokens, triggerTokens)
-              if (totalTokens <= triggerTokens) {
+              // triggerTokens
+              if (totalTokens <= triggerTokens && newMessages.length <= 200) {
                 // Under threshold — use assembled context directly, no LLM call needed
                 history = [
                   { role: 'user', content: SUMMARY_PREFIX + '\n\n' + snapshot.summary },
@@ -756,7 +684,7 @@ export class ChatRunSocket {
             } else if (history.length > 4) {
               // No snapshot — check if raw history exceeds threshold
 
-              if (totalTokens <= triggerTokens) {
+              if (totalTokens <= triggerTokens && history.length <= 200) {
                 // Under threshold — use raw history as-is
                 logger.info('[context-compress] session=%s: %d messages, ~%d tokens — under threshold, skip', session_id, history.length, totalTokens)
               } else {
@@ -879,7 +807,7 @@ export class ChatRunSocket {
 
       // Convert conversation_history from OpenAI format to Anthropic format
       if (body.conversation_history && Array.isArray(body.conversation_history)) {
-        body.conversation_history = convertToAnthropicFormat(body.conversation_history)
+        body.conversation_history = convertHistoryFormat(body.conversation_history)
       }
       const res = await fetch(`${upstream}/v1/runs`, {
         method: 'POST',
@@ -890,6 +818,7 @@ export class ChatRunSocket {
       if (!res.ok) {
         const text = await res.text().catch(() => '')
         emit('run.failed', { event: 'run.failed', error: `Upstream ${res.status}: ${text}` })
+        if (session_id) this.markCompleted(socket, session_id, { event: 'run.failed' })
         return
       }
 
@@ -897,6 +826,7 @@ export class ChatRunSocket {
       const runId = runData.run_id
       if (!runId) {
         emit('run.failed', { event: 'run.failed', error: 'No run_id in upstream response' })
+        if (session_id) this.markCompleted(socket, session_id, { event: 'run.failed' })
         return
       }
 
@@ -930,6 +860,10 @@ export class ChatRunSocket {
 
       // @ts-ignore - eventsource library types are too strict
       const source = new EventSource(eventsUrl.toString(), eventSourceInit)
+      if (session_id) {
+        const state = this.getOrCreateSession(session_id)
+        state.eventSource = source
+      }
 
       source.onmessage = (event: MessageEvent) => {
         try {
@@ -1121,19 +1055,31 @@ export class ChatRunSocket {
             }
           }
 
+          if (parsed.event === 'run.completed' || parsed.event === 'run.failed') {
+            source.close()
+            if (session_id && this.sessionMap.get(session_id)?.isAborting) {
+              logger.info({
+                sessionId: session_id,
+                runId: parsed.run_id,
+                event: parsed.event,
+              }, '[chat-run-socket][abort] suppressing upstream terminal event during abort')
+              return
+            }
+            if (session_id) this.markCompleted(socket, session_id, { event: parsed.event, run_id: parsed.run_id })
+          }
+
           // Usage will be calculated after syncFromHermes completes (in markCompleted)
 
           emit(parsed.event || 'message', parsed)
-
-          if (parsed.event === 'run.completed' || parsed.event === 'run.failed') {
-            source.close()
-            if (session_id) this.markCompleted(socket, session_id, { event: parsed.event, run_id: parsed.run_id })
-          }
         } catch { /* not JSON, skip */ }
       }
 
       source.onerror = () => {
         source.close()
+        if (session_id && this.sessionMap.get(session_id)?.isAborting) {
+          logger.info({ sessionId: session_id }, '[chat-run-socket][abort] event source closed during abort')
+          return
+        }
         emit('run.failed', { event: 'run.failed', error: 'EventSource connection lost' })
         if (session_id) this.markCompleted(socket, session_id, { event: 'run.failed' })
       }
@@ -1145,20 +1091,78 @@ export class ChatRunSocket {
 
   // --- Abort handler ---
 
-  private handleAbort(socket: Socket, sessionId: string) {
+  private async handleAbort(socket: Socket, sessionId: string) {
     const state = this.sessionMap.get(sessionId)
-    if (state?.isWorking && state.abortController) {
-      state.abortController.abort()
-      this.markCompleted(socket, sessionId, { event: 'run.failed', run_id: state.runId })
+    if (!state?.isWorking || !state.runId) {
+      logger.info({ sessionId }, '[chat-run-socket][abort] ignored: no active run')
+      return
     }
+
+    const runId = state.runId
+    state.isAborting = true
+    this.replaceState(sessionId, 'abort.started', {
+      event: 'abort.started',
+      run_id: runId,
+      graceMs: 5000,
+    })
+    this.emitToSession(socket, sessionId, 'abort.started', {
+      event: 'abort.started',
+      run_id: runId,
+      graceMs: 5000,
+    })
+    logger.info({ sessionId, runId }, '[chat-run-socket][abort] started')
+
+    // Call upstream stop endpoint
+    const profile = state.profile || 'default'
+    const upstream = this.gatewayManager.getUpstream(profile).replace(/\/$/, '')
+    const apiKey = this.gatewayManager.getApiKey(profile) || undefined
+
+    try {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+      if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`
+
+      logger.info({ sessionId, runId, upstream }, '[chat-run-socket][abort] calling upstream stop')
+      await fetch(`${upstream}/v1/runs/${runId}/stop`, {
+        method: 'POST',
+        headers,
+      })
+      logger.info('[chat-run-socket] called upstream stop for run %s (session: %s)', runId, sessionId)
+      logger.info({ sessionId, runId, graceMs: 5000 }, '[chat-run-socket][abort] upstream stop accepted, waiting for graceful exit')
+
+      // Wait for upstream to process the stop request
+      await new Promise(resolve => setTimeout(resolve, 5000))
+    } catch (err: any) {
+      logger.warn(err, '[chat-run-socket] failed to call upstream stop for run %s (session: %s)', runId, sessionId)
+      logger.warn({ sessionId, runId, error: err?.message }, '[chat-run-socket][abort] upstream stop failed, continuing local completion')
+    }
+
+    // Close local EventSource connection after the upstream grace period.
+    if (state.eventSource) {
+      state.eventSource.close()
+      state.eventSource = undefined
+      logger.info({ sessionId, runId }, '[chat-run-socket][abort] event source closed')
+    }
+    if (state.abortController) {
+      state.abortController.abort()
+    }
+
+    await this.markAbortCompleted(socket, sessionId, runId)
   }
 
   /** Mark a session run as completed/failed so reconnecting clients get notified */
   private markCompleted(socket: Socket, sessionId: string, _info: { event: string; run_id?: string }) {
     const state = this.sessionMap.get(sessionId)
     if (state) {
+      if (state.isAborting) {
+        logger.info({
+          sessionId,
+          runId: state.runId,
+        }, '[chat-run-socket][abort] terminal upstream event observed; abort handler will finish cleanup')
+        return
+      }
       state.isWorking = false
       state.abortController = undefined
+      state.eventSource = undefined
       state.runId = undefined
       state.events = []
       // Sync messages from Hermes ephemeral session to local DB
@@ -1167,9 +1171,45 @@ export class ChatRunSocket {
         const prof = state.profile
         this.hermesSessionIds.delete(sessionId)
         state.profile = undefined
-        this.syncFromHermes(socket, sessionId, hermesId, prof)
+        void this.syncFromHermes(socket, sessionId, hermesId, prof)
       }
     }
+  }
+
+  private async markAbortCompleted(socket: Socket, sessionId: string, runId: string) {
+    const state = this.sessionMap.get(sessionId)
+    if (!state) return
+
+    const hermesId = this.hermesSessionIds.get(sessionId)
+    const profile = state.profile
+    let synced = false
+    if (useLocalSessionStore() && hermesId) {
+      this.hermesSessionIds.delete(sessionId)
+      logger.info({ sessionId, hermesId, profile: profile || 'default' }, '[chat-run-socket][abort] syncing stopped run from Hermes')
+      synced = await this.syncFromHermes(socket, sessionId, hermesId, profile, {
+        maxAttempts: 10,
+        delayMs: 1000,
+      })
+    }
+
+    state.isWorking = false
+    state.isAborting = false
+    state.profile = undefined
+    state.abortController = undefined
+    state.eventSource = undefined
+    state.runId = undefined
+    this.replaceState(sessionId, 'abort.completed', {
+      event: 'abort.completed',
+      run_id: runId,
+      synced,
+    })
+    this.emitToSession(socket, sessionId, 'abort.completed', {
+      event: 'abort.completed',
+      run_id: runId,
+      synced,
+    })
+    state.events = []
+    logger.info({ sessionId, runId, synced }, '[chat-run-socket][abort] completed')
   }
 
   /**
@@ -1188,17 +1228,20 @@ export class ChatRunSocket {
 
       const snapshot = getCompressionSnapshot(sid)
       let inputTokens: number
+      let outputTokens: number
       if (snapshot && msgs.length) {
         const newMessages = msgs.slice(snapshot.lastMessageIndex + 1)
         inputTokens = countTokens(SUMMARY_PREFIX + snapshot.summary) +
-          newMessages.reduce((sum, m) => sum + countTokens(m.content || ''), 0)
+          newMessages.filter(m => m.role === 'user').reduce((sum, m) => sum + countTokens(m.content || ''), 0)
+        outputTokens = newMessages
+          .filter(m => m.role === 'assistant' || m.role === 'tool')
+          .reduce((sum, m) => sum + countTokens(m.content || '') + countTokens(m.tool_calls + '' || ''), 0)
       } else {
-        inputTokens = msgs.reduce((sum, m) => sum + countTokens(m.content || ''), 0)
+        inputTokens = msgs.filter(m => m.role === 'user').reduce((sum, m) => sum + countTokens(m.content || ''), 0)
+        outputTokens = msgs
+          .filter(m => m.role === 'assistant' || m.role === 'tool')
+          .reduce((sum, m) => sum + countTokens(m.content || '') + countTokens(m.tool_calls + '' || ''), 0)
       }
-
-      const outputTokens = msgs
-        .filter(m => m.role === 'assistant')
-        .reduce((sum, m) => sum + countTokens(m.content || ''), 0)
       state.inputTokens = inputTokens
       state.outputTokens = outputTokens
       emit('usage.updated', {
@@ -1219,122 +1262,150 @@ export class ChatRunSocket {
    * and write to local DB. This gives us tool results that SSE events don't include.
    * After sync, enqueues the ephemeral session for deletion.
    */
-  private syncFromHermes(socket: Socket, localSessionId: string, hermesSessionId: string, profile?: string) {
-    getSessionDetailFromDb(hermesSessionId)
-      .then((detail) => {
+  private async syncFromHermes(
+    socket: Socket,
+    localSessionId: string,
+    hermesSessionId: string,
+    profile?: string,
+    options?: { maxAttempts?: number; delayMs?: number },
+  ): Promise<boolean> {
+    const maxAttempts = options?.maxAttempts || 1
+    const delayMs = options?.delayMs || 0
+    try {
+      let detail: Awaited<ReturnType<typeof getSessionDetailFromDb>> | null = null
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        detail = await getSessionDetailFromDb(hermesSessionId)
         if (!detail || !detail.messages?.length) {
-          logger.warn('[chat-run-socket] syncFromHermes: no data for Hermes session %s', hermesSessionId)
-          return
+          logger.warn('[chat-run-socket] syncFromHermes: no data for Hermes session %s (attempt %d/%d)', hermesSessionId, attempt, maxAttempts)
+          logger.info({ localSessionId, hermesSessionId, attempt, maxAttempts }, '[chat-run-socket][abort] sync waiting for Hermes data')
+          if (attempt < maxAttempts && delayMs > 0) {
+            await new Promise(resolve => setTimeout(resolve, delayMs))
+            continue
+          }
+          this.enqueueEphemeralDelete(hermesSessionId, profile)
+          return false
         }
-        // Skip user messages — already written to local DB in handleRun
-        const toInsert = detail.messages.filter(m => m.role !== 'user')
+        break
+      }
+      if (!detail) return false
 
-        // Build tool_call_id → function.name lookup from assistant messages
-        // (Hermes stores tool_name as NULL, name lives inside tool_calls JSON)
-        const toolNameMap = new Map<string, string>()
-        for (const msg of detail.messages) {
-          if (msg.role === 'assistant' && Array.isArray(msg.tool_calls)) {
-            for (const tc of msg.tool_calls) {
-              const id = tc.id || tc.call_id || tc.tool_call_id
-              const name = tc.function?.name || tc.name
-              if (id && name) toolNameMap.set(id, name)
-            }
+      // Skip user messages — already written to local DB in handleRun
+      const toInsert = detail.messages.filter(m => m.role !== 'user')
+
+      // Build tool_call_id → function.name lookup from assistant messages
+      // (Hermes stores tool_name as NULL, name lives inside tool_calls JSON)
+      const toolNameMap = new Map<string, string>()
+      for (const msg of detail.messages) {
+        if (msg.role === 'assistant' && Array.isArray(msg.tool_calls)) {
+          for (const tc of msg.tool_calls) {
+            const id = tc.id || tc.call_id || tc.tool_call_id
+            const name = tc.function?.name || tc.name
+            if (id && name) toolNameMap.set(id, name)
           }
         }
+      }
 
-        if (toInsert.length > 0) {
-          // Get in-memory messages to preserve reasoning that was streamed via SSE
-          const state = this.sessionMap.get(localSessionId)
-          const memoryMessages = state?.messages || []
-          logger.info('[chat-run-socket] syncFromHermes: memory has %d messages, DB has %d messages',
-            memoryMessages.length, toInsert.length)
+      if (toInsert.length > 0) {
+        // Get in-memory messages to preserve reasoning that was streamed via SSE
+        const state = this.sessionMap.get(localSessionId)
+        const memoryMessages = state?.messages || []
+        logger.info('[chat-run-socket] syncFromHermes: memory has %d messages, DB has %d messages',
+          memoryMessages.length, toInsert.length)
 
-          // Match messages by order since Hermes DB and memory should have same sequence
-          let memoryIdx = 0
-          let mergedCount = 0
-          for (let i = 0; i < toInsert.length && memoryIdx < memoryMessages.length; i++) {
-            const dbMsg = toInsert[i]
-            // Skip user messages in memory when matching
-            while (memoryIdx < memoryMessages.length && memoryMessages[memoryIdx].role === 'user') {
-              memoryIdx++
-            }
-            if (memoryIdx >= memoryMessages.length) break
-            const memoryMsg = memoryMessages[memoryIdx]
-            // Only merge if roles match
-            if (dbMsg.role === memoryMsg.role) {
-              // Merge reasoning from memory if DB doesn't have it
-              if (!dbMsg.reasoning && memoryMsg.reasoning) {
-                dbMsg.reasoning = memoryMsg.reasoning
-                mergedCount++
-                logger.info('[chat-run-socket] syncFromHermes: merged reasoning from memory to DB for %s message at index %d',
-                  dbMsg.role, i)
-              }
-            }
+        // Match messages by order since Hermes DB and memory should have same sequence
+        let memoryIdx = 0
+        let mergedCount = 0
+        for (let i = 0; i < toInsert.length && memoryIdx < memoryMessages.length; i++) {
+          const dbMsg = toInsert[i]
+          // Skip user messages in memory when matching
+          while (memoryIdx < memoryMessages.length && memoryMessages[memoryIdx].role === 'user') {
             memoryIdx++
           }
-
-          if (mergedCount > 0) {
-            logger.info('[chat-run-socket] syncFromHermes: merged reasoning for %d messages', mergedCount)
-          }
-
-          for (const msg of toInsert) {
-            // Resolve tool_name from assistant's tool_calls if missing
-            let toolName = msg.tool_name || null
-            if (!toolName && msg.tool_call_id) {
-              toolName = toolNameMap.get(msg.tool_call_id) || null
+          if (memoryIdx >= memoryMessages.length) break
+          const memoryMsg = memoryMessages[memoryIdx]
+          // Only merge if roles match
+          if (dbMsg.role === memoryMsg.role) {
+            // Merge reasoning from memory if DB doesn't have it
+            if (!dbMsg.reasoning && memoryMsg.reasoning) {
+              dbMsg.reasoning = memoryMsg.reasoning
+              mergedCount++
+              logger.info('[chat-run-socket] syncFromHermes: merged reasoning from memory to DB for %s message at index %d',
+                dbMsg.role, i)
             }
-            addMessage({
-              session_id: localSessionId,
-              role: msg.role,
-              content: msg.content || '',
-              tool_call_id: msg.tool_call_id || null,
-              tool_calls: msg.tool_calls || null,
-              tool_name: toolName,
-              timestamp: msg.timestamp || Math.floor(Date.now() / 1000),
-              token_count: msg.token_count || null,
-              finish_reason: msg.finish_reason || null,
-              reasoning: msg.reasoning || null,  // Now includes merged reasoning
-              reasoning_details: msg.reasoning_details || null,
-              reasoning_content: msg.reasoning_content || null,
-              codex_reasoning_items: msg.codex_reasoning_items || null,
-            })
           }
-          logger.info('[chat-run-socket] syncFromHermes: synced %d messages to local session %s', toInsert.length, localSessionId)
+          memoryIdx++
         }
 
-        updateSessionStats(localSessionId)
-
-        // Record usage from Hermes session
-        updateUsage(localSessionId, {
-          inputTokens: detail.input_tokens,
-          outputTokens: detail.output_tokens,
-          cacheReadTokens: detail.cache_read_tokens,
-          cacheWriteTokens: detail.cache_write_tokens,
-          reasoningTokens: detail.reasoning_tokens,
-          model: detail.model,
-          profile: profile || 'default',
-        })
-
-        // Calculate usage from DB now that data is complete
-        // Use inputTokens already set by compression path if available
-        const state = this.sessionMap.get(localSessionId)
-        if (state) {
-          const messages = this.handleMessage(toInsert, localSessionId)
-          if (messages.length > 0) {
-            this.replaceByHermesSessionId(localSessionId, hermesSessionId, messages)
-          }
-          const emit = (event: string, payload: any) => {
-            socket.emit(event, { ...payload, session_id: localSessionId })
-          }
-          this.calcAndUpdateUsage(localSessionId, state, emit)
+        if (mergedCount > 0) {
+          logger.info('[chat-run-socket] syncFromHermes: merged reasoning for %d messages', mergedCount)
         }
 
-        // Enqueue ephemeral session for deferred deletion
-        this.enqueueEphemeralDelete(hermesSessionId, profile)
+        // Batch insert with transaction for atomicity
+        addMessages(toInsert.map(msg => {
+          // Resolve tool_name from assistant's tool_calls if missing
+          let toolName = msg.tool_name || null
+          if (!toolName && msg.tool_call_id) {
+            toolName = toolNameMap.get(msg.tool_call_id) || null
+          }
+          return {
+            session_id: localSessionId,
+            role: msg.role,
+            content: msg.content || '',
+            tool_call_id: msg.tool_call_id || null,
+            tool_calls: msg.tool_calls || null,
+            tool_name: toolName,
+            timestamp: msg.timestamp || Math.floor(Date.now() / 1000),
+            token_count: msg.token_count || null,
+            finish_reason: msg.finish_reason || null,
+            reasoning: msg.reasoning || null,
+            reasoning_details: msg.reasoning_details || null,
+            reasoning_content: msg.reasoning_content || null,
+            codex_reasoning_items: msg.codex_reasoning_items || null,
+          }
+        }))
+
+        logger.info('[chat-run-socket] syncFromHermes: synced %d messages to local session %s', toInsert.length, localSessionId)
+      }
+
+      updateSessionStats(localSessionId)
+
+      // Record usage from Hermes session
+      updateUsage(localSessionId, {
+        inputTokens: detail.input_tokens,
+        outputTokens: detail.output_tokens,
+        cacheReadTokens: detail.cache_read_tokens,
+        cacheWriteTokens: detail.cache_write_tokens,
+        reasoningTokens: detail.reasoning_tokens,
+        model: detail.model,
+        profile: profile || 'default',
       })
-      .catch((err: any) => {
-        logger.warn(err, '[chat-run-socket] syncFromHermes failed for session %s (hermesId: %s, profile: %s)', localSessionId, hermesSessionId, profile || 'default')
-      })
+
+      // Calculate usage from DB now that data is complete
+      // Use inputTokens already set by compression path if available
+      const state = this.sessionMap.get(localSessionId)
+      if (state) {
+        const messages = this.handleMessage(toInsert, localSessionId)
+        if (messages.length > 0) {
+          this.replaceByHermesSessionId(localSessionId, hermesSessionId, messages)
+        }
+        const emit = (event: string, payload: any) => {
+          const tagged = localSessionId ? { ...payload, localSessionId } : payload
+          if (localSessionId) {
+            this.nsp.to(`session:${localSessionId}`).emit(event, tagged)
+          } else if (socket.connected) {
+            socket.emit(event, tagged)
+          }
+        }
+        this.calcAndUpdateUsage(localSessionId, state, emit)
+      }
+
+      // Enqueue ephemeral session for deferred deletion
+      this.enqueueEphemeralDelete(hermesSessionId, profile)
+      return true
+    } catch (err: any) {
+      logger.warn(err, '[chat-run-socket] syncFromHermes failed for session %s (hermesId: %s, profile: %s)', localSessionId, hermesSessionId, profile || 'default')
+      return false
+    }
   }
   private replaceByHermesSessionId(session_id: string, hermesSessionId: string, newItems: SessionMessage[]) {
     let start = -1
@@ -1400,6 +1471,30 @@ export class ChatRunSocket {
       }
     }
     this.pushState(sessionId, event, data)
+  }
+
+  private emitToSession(socket: Socket, sessionId: string, event: string, payload: any) {
+    const tagged = { ...payload, session_id: sessionId }
+    this.nsp.to(`session:${sessionId}`).emit(event, tagged)
+    if (!this.nsp.adapter.rooms.get(`session:${sessionId}`)?.size && socket.connected) {
+      socket.emit(event, tagged)
+    }
+  }
+
+  /** Close all active EventSource connections and abort controllers */
+  close() {
+    for (const [sessionId, state] of this.sessionMap.entries()) {
+      if (state.abortController) {
+        try {
+          state.abortController.abort()
+        } catch (e) {
+          logger.warn(e, '[chat-run-socket] failed to abort controller for session %s', sessionId)
+        }
+      }
+    }
+    this.sessionMap.clear()
+    this.hermesSessionIds.clear()
+    logger.info('[chat-run-socket] closed all connections and cleared state')
   }
 }
 

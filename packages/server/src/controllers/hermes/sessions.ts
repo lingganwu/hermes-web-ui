@@ -1,7 +1,7 @@
 import * as hermesCli from '../../services/hermes/hermes-cli'
 import { listConversationSummaries, getConversationDetail } from '../../services/hermes/conversations'
 import { listConversationSummariesFromDb, getConversationDetailFromDb } from '../../db/hermes/conversations-db'
-import { listSessionSummaries, searchSessionSummaries, getUsageStatsFromDb } from '../../db/hermes/sessions-db'
+import { listSessionSummaries, searchSessionSummaries, getUsageStatsFromDb, getSessionDetailFromDb } from '../../db/hermes/sessions-db'
 import {
   listSessions as localListSessions,
   searchSessions as localSearchSessions,
@@ -232,7 +232,18 @@ export async function get(ctx: any) {
  * GET /api/hermes/sessions/hermes/:id
  */
 export async function getHermesSession(ctx: any) {
+  // Try database first (consistent with listHermesSessions)
+  try {
+    const session = await getSessionDetailFromDb(ctx.params.id)
+    if (session && session.source !== 'api_server' && session.source !== 'cron') {
+      ctx.body = { session }
+      return
+    }
+  } catch (err) {
+    logger.warn(err, 'Hermes Session DB: detail query failed, falling back to CLI')
+  }
 
+  // Fallback to CLI
   const session = await hermesCli.getSession(ctx.params.id)
   if (!session) {
     ctx.status = 404
@@ -271,6 +282,54 @@ export async function remove(ctx: any) {
   }
   deleteUsage(sessionId)
   ctx.body = { ok: true }
+}
+
+export async function batchRemove(ctx: any) {
+  const { ids } = ctx.request.body as { ids?: string[] }
+  if (!ids || !Array.isArray(ids) || ids.length === 0) {
+    ctx.status = 400
+    ctx.body = { error: 'ids is required and must be a non-empty array' }
+    return
+  }
+
+  const validIds = ids.filter(id => typeof id === 'string' && id.trim() !== '')
+  if (validIds.length === 0) {
+    ctx.status = 400
+    ctx.body = { error: 'No valid session ids provided' }
+    return
+  }
+
+  const results = {
+    deleted: 0,
+    failed: 0,
+    errors: [] as Array<{ id: string; error: string }>
+  }
+
+  if (useLocalSessionStore()) {
+    for (const id of validIds) {
+      const ok = localDeleteSession(id)
+      if (ok) {
+        deleteUsage(id)
+        results.deleted++
+      } else {
+        results.failed++
+        results.errors.push({ id, error: 'Failed to delete session' })
+      }
+    }
+  } else {
+    for (const id of validIds) {
+      const ok = await hermesCli.deleteSession(id)
+      if (ok) {
+        deleteUsage(id)
+        results.deleted++
+      } else {
+        results.failed++
+        results.errors.push({ id, error: 'Failed to delete session' })
+      }
+    }
+  }
+
+  ctx.body = { ...results, ok: true }
 }
 
 export async function usageBatch(ctx: any) {

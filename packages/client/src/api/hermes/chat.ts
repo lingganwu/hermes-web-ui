@@ -70,6 +70,8 @@ const sessionEventHandlers = new Map<string, {
   onRunFailed: (event: RunEvent) => void
   onCompressionStarted: (event: RunEvent) => void
   onCompressionCompleted: (event: RunEvent) => void
+  onAbortStarted: (event: RunEvent) => void
+  onAbortCompleted: (event: RunEvent) => void
   onUsageUpdated: (event: RunEvent) => void
 }>()
 
@@ -224,6 +226,34 @@ function globalCompressionCompletedHandler(event: RunEvent): void {
 }
 
 /**
+ * Global abort.started event handler
+ */
+function globalAbortStartedHandler(event: RunEvent): void {
+  const sid = event.session_id
+  if (!sid) return
+
+  const handlers = sessionEventHandlers.get(sid)
+  if (handlers?.onAbortStarted) {
+    handlers.onAbortStarted(event)
+  }
+}
+
+/**
+ * Global abort.completed event handler
+ */
+function globalAbortCompletedHandler(event: RunEvent): void {
+  const sid = event.session_id
+  if (!sid) return
+
+  const handlers = sessionEventHandlers.get(sid)
+  if (handlers?.onAbortCompleted) {
+    handlers.onAbortCompleted(event)
+  }
+
+  sessionEventHandlers.delete(sid)
+}
+
+/**
  * Global usage.updated event handler
  */
 function globalUsageUpdatedHandler(event: RunEvent): void {
@@ -256,6 +286,8 @@ export function registerSessionHandlers(
     onRunFailed: (event: RunEvent) => void
     onCompressionStarted: (event: RunEvent) => void
     onCompressionCompleted: (event: RunEvent) => void
+    onAbortStarted: (event: RunEvent) => void
+    onAbortCompleted: (event: RunEvent) => void
     onUsageUpdated: (event: RunEvent) => void
   }
 ): () => void {
@@ -291,7 +323,17 @@ export function connectChatRun(): Socket {
 
   const baseUrl = getBaseUrlValue()
   const token = getApiKey()
-  const profile = localStorage.getItem('hermes_active_profile_name') || 'default'
+
+  // Get active profile from store (authoritative source)
+  let profile = 'default'
+  try {
+    const { useProfilesStore } = require('@/stores/hermes/profiles')
+    const profilesStore = useProfilesStore()
+    profile = profilesStore.activeProfileName || 'default'
+  } catch {
+    // Fallback to localStorage during early initialization
+    profile = localStorage.getItem('hermes_active_profile_name') || 'default'
+  }
 
   chatRunSocket = io(`${baseUrl}/chat-run`, {
     auth: { token },
@@ -323,6 +365,8 @@ export function connectChatRun(): Socket {
     // Compression events
     chatRunSocket.on('compression.started', globalCompressionStartedHandler)
     chatRunSocket.on('compression.completed', globalCompressionCompletedHandler)
+    chatRunSocket.on('abort.started', globalAbortStartedHandler)
+    chatRunSocket.on('abort.completed', globalAbortCompletedHandler)
 
     // Usage events
     chatRunSocket.on('usage.updated', globalUsageUpdatedHandler)
@@ -351,7 +395,7 @@ export function disconnectChatRun(): void {
  */
 export function resumeSession(
   sessionId: string,
-  onResumed: (data: { session_id: string; messages: any[]; isWorking: boolean; events: any[]; inputTokens?: number; outputTokens?: number }) => void,
+  onResumed: (data: { session_id: string; messages: any[]; isWorking: boolean; isAborting?: boolean; events: any[]; inputTokens?: number; outputTokens?: number }) => void,
 ): Socket {
   const socket = connectChatRun()
 
@@ -426,6 +470,16 @@ export function startRunViaSocket(
       if (closed) return
       onEvent(evt)
     },
+    onAbortStarted: (evt: RunEvent) => {
+      if (closed) return
+      onEvent(evt)
+    },
+    onAbortCompleted: (evt: RunEvent) => {
+      if (closed) return
+      onEvent(evt)
+      closed = true
+      onDone()
+    },
     onUsageUpdated: (evt: RunEvent) => {
       if (closed) return
       onEvent(evt)
@@ -442,8 +496,6 @@ export function startRunViaSocket(
   return {
     abort: () => {
       if (!closed) {
-        closed = true
-        sessionEventHandlers.delete(sid)
         socket.emit('abort', { session_id: sid })
       }
     },
